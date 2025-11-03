@@ -34,4 +34,3 @@ CREATE AGGREGATE rb_xor_cardinality_agg(roaringbitmap)(
   DESERIALFUNC = rb_deserialize,
   PARALLEL = SAFE
 );
-

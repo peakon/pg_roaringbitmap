@@ -243,6 +243,11 @@ CREATE OR REPLACE FUNCTION rb_iterate(roaringbitmap)
    AS 'MODULE_PATHNAME', 'rb_iterate'
    LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
+CREATE OR REPLACE FUNCTION rb_kmerge(bitmaps roaringbitmap[])
+  RETURNS TABLE (element int, sources int[])
+  AS 'MODULE_PATHNAME', 'rb_kmerge'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
 CREATE OR REPLACE FUNCTION rb_runoptimize(roaringbitmap)
   RETURNS roaringbitmap
   AS 'MODULE_PATHNAME', 'rb_runoptimize'

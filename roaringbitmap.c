@@ -1,4 +1,5 @@
 #include "roaringbitmap.h"
+#include "utils/lsyscache.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -128,6 +129,311 @@ ArrayContainsNulls(ArrayType *array) {
 }
 
 
+
+// rb_kmerge SRF
+PG_FUNCTION_INFO_V1(rb_kmerge);
+Datum rb_kmerge(PG_FUNCTION_ARGS);
+
+/* ============================================================
+ * rb_kmerge: k-way merge with source-set grouping
+ * ============================================================
+ *
+ * Given N bitmaps, performs a k-way merge and groups elements by which
+ * combination of input bitmaps contains them.  Returns one row per unique
+ * source-set pattern with:
+ *   sources int[]         – 1-based indices of input bitmaps
+ *   members roaringbitmap – all elements sharing that source-set
+ *
+ * Uses PostgreSQL's lib/simplehash.h for the hash table and a hand-rolled
+ * min-heap for the k-way merge.
+ */
+
+#define KM_MAX_WORDS 16  /* supports up to 1024 inputs */
+
+/* --- Min-heap for k-way merge --- */
+
+typedef struct KMHeapNode
+{
+    int     src;    /* 0-based index of iterator */
+    uint32  value;  /* iterator's current value */
+} KMHeapNode;
+
+static inline void
+km_heap_sift_down(KMHeapNode *heap, int size, int idx)
+{
+    for (;;)
+    {
+        int left = (idx << 1) + 1;
+        if (left >= size) break;
+        int right = left + 1;
+        int smallest = left;
+        if (right < size && heap[right].value < heap[left].value)
+            smallest = right;
+        if (!(heap[smallest].value < heap[idx].value))
+            break;
+        KMHeapNode tmp = heap[idx];
+        heap[idx] = heap[smallest];
+        heap[smallest] = tmp;
+        idx = smallest;
+    }
+}
+
+static inline void
+km_heap_build(KMHeapNode *heap, int size)
+{
+    for (int i = (size >> 1) - 1; i >= 0; i--)
+        km_heap_sift_down(heap, size, i);
+}
+
+/* --- Source-set key: variable-width bitmask in a fixed-max struct --- */
+
+typedef struct KMGroupKey
+{
+    uint64 words[KM_MAX_WORDS];
+} KMGroupKey;
+
+/* Hash a source-set key (only the first nwords words matter) */
+static inline uint32
+kmg_hash_key(const uint64 *words, int nwords)
+{
+    uint64 h = 0;
+    for (int i = 0; i < nwords; i++)
+    {
+        h ^= words[i];
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        h *= 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+    }
+    return (uint32) h;
+}
+
+/* Private data threaded through the hash table for variable-width ops */
+typedef struct KMGroupPrivate
+{
+    int nwords;
+} KMGroupPrivate;
+
+/* --- simplehash element type --- */
+
+typedef struct KMGroupEntry
+{
+    KMGroupKey              key;
+    roaring_bitmap_t       *members;
+    roaring_bulk_context_t  bulk_ctx;
+    char                    status;     /* required by simplehash */
+} KMGroupEntry;
+
+/* Instantiate the hash table (declarations) */
+#define SH_PREFIX           kmgroup
+#define SH_ELEMENT_TYPE     KMGroupEntry
+#define SH_KEY_TYPE         KMGroupKey
+#define SH_KEY              key
+#define SH_HASH_KEY(tb, k)  kmg_hash_key((k).words, \
+                                ((KMGroupPrivate *) (tb)->private_data)->nwords)
+#define SH_EQUAL(tb, a, b)  (memcmp((a).words, (b).words, \
+                                ((KMGroupPrivate *) (tb)->private_data)->nwords \
+                                * sizeof(uint64)) == 0)
+#define SH_SCOPE            static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+/* --- SRF state: hash table + iterator --- */
+
+typedef struct
+{
+    kmgroup_hash       *ht;
+    kmgroup_iterator    iter;
+    int                 nwords;
+    TupleDesc           tupdesc;
+} KMergeState;
+
+Datum
+rb_kmerge(PG_FUNCTION_ARGS)
+{
+    FuncCallContext    *funcctx;
+    MemoryContext       oldcontext;
+
+    if (SRF_IS_FIRSTCALL())
+    {
+        ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(0);
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        /* Deconstruct input array */
+        int16   elmlen;
+        bool    elmbyval;
+        char    elmalign;
+        Oid     elmtype = ARR_ELEMTYPE(arr);
+        get_typlenbyvalalign(elmtype, &elmlen, &elmbyval, &elmalign);
+
+        Datum  *elem_values;
+        bool   *elem_nulls;
+        int     nelems;
+        deconstruct_array(arr, elmtype, elmlen, elmbyval, elmalign,
+                          &elem_values, &elem_nulls, &nelems);
+
+        int nwords = (nelems + 63) / 64;
+        if (nwords < 1) nwords = 1;
+        if (nwords > KM_MAX_WORDS)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("rb_kmerge supports at most %d inputs",
+                            KM_MAX_WORDS * 64)));
+
+        /* Deserialize bitmaps and create iterators (indexed by array position) */
+        roaring_uint32_iterator_t **iters =
+            (roaring_uint32_iterator_t **) palloc0(
+                sizeof(roaring_uint32_iterator_t *) * Max(nelems, 1));
+
+        KMHeapNode *heap = (KMHeapNode *) palloc(sizeof(KMHeapNode) * Max(nelems, 1));
+        int heap_size = 0;
+
+        for (int i = 0; i < nelems; i++)
+        {
+            if (elem_nulls[i])
+                continue;
+
+            bytea *data = (bytea *) DatumGetPointer(elem_values[i]);
+            roaring_bitmap_t *rb =
+                roaring_bitmap_portable_deserialize_safe(VARDATA(data),
+                    VARSIZE(data) - VARHDRSZ);
+            if (!rb)
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("bitmap format is error")));
+
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            iters[i] = it;
+            if (it->has_value)
+            {
+                heap[heap_size].src = i;
+                heap[heap_size].value = it->current_value;
+                heap_size++;
+            }
+        }
+        if (heap_size > 1)
+            km_heap_build(heap, heap_size);
+
+        /* Set up hash table for grouping by source-set */
+        KMGroupPrivate *priv =
+            (KMGroupPrivate *) palloc(sizeof(KMGroupPrivate));
+        priv->nwords = nwords;
+        kmgroup_hash *ht = kmgroup_create(funcctx->multi_call_memory_ctx,
+                                          256, priv);
+
+        /* K-way merge: collect sources for each element, group in HT */
+        KMGroupKey bitmask;
+        memset(&bitmask, 0, sizeof(bitmask));
+
+        while (heap_size > 0)
+        {
+            uint32 current_val = heap[0].value;
+            memset(bitmask.words, 0, nwords * sizeof(uint64));
+
+            /* Collect all sources that contain current_val */
+            do
+            {
+                int src = heap[0].src;
+                bitmask.words[src / 64] |= ((uint64) 1) << (src % 64);
+
+                roaring_uint32_iterator_t *it = iters[src];
+                roaring_uint32_iterator_advance(it);
+                if (it->has_value)
+                {
+                    heap[0].value = it->current_value;
+                    km_heap_sift_down(heap, heap_size, 0);
+                }
+                else
+                {
+                    heap[0] = heap[heap_size - 1];
+                    heap_size--;
+                    if (heap_size > 0)
+                        km_heap_sift_down(heap, heap_size, 0);
+                }
+            }
+            while (heap_size > 0 && heap[0].value == current_val);
+
+            /* Insert into the group for this source-set */
+            bool found;
+            KMGroupEntry *entry = kmgroup_insert(ht, bitmask, &found);
+            if (!found)
+            {
+                entry->members = roaring_bitmap_create();
+                memset(&entry->bulk_ctx, 0, sizeof(roaring_bulk_context_t));
+            }
+            roaring_bitmap_add_bulk(entry->members, &entry->bulk_ctx,
+                                    current_val);
+        }
+
+        /* Clean up iterators and heap */
+        for (int i = 0; i < nelems; i++)
+        {
+            if (iters[i])
+                roaring_uint32_iterator_free(iters[i]);
+        }
+        pfree(iters);
+        pfree(heap);
+
+        /* Store HT and prepare iterator for per-call phase */
+        KMergeState *state =
+            (KMergeState *) palloc0(sizeof(KMergeState));
+        state->ht = ht;
+        state->nwords = nwords;
+        kmgroup_start_iterate(ht, &state->iter);
+
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("return type must be a row type")));
+        BlessTupleDesc(tupdesc);
+        state->tupdesc = tupdesc;
+
+        funcctx->user_fctx = state;
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    KMergeState *state = (KMergeState *) funcctx->user_fctx;
+
+    KMGroupEntry *entry = kmgroup_iterate(state->ht, &state->iter);
+    if (entry == NULL)
+        SRF_RETURN_DONE(funcctx);
+
+    /* Convert bitmask to int[] of 1-based source indices (single pass) */
+    Datum src_buf[KM_MAX_WORDS * 64];
+    int nsources = 0;
+    for (int w = 0; w < KM_MAX_WORDS; w++)
+    {
+        uint64 v = entry->key.words[w];
+        int base = w * 64;
+        while (v)
+        {
+            int bit = __builtin_ctzll(v);
+            src_buf[nsources++] = Int32GetDatum(base + bit + 1);
+            v &= v - 1;
+        }
+    }
+    ArrayType *src_array = construct_array(src_buf, nsources, INT4OID,
+                                           sizeof(int32), true, 'i');
+
+    /* Serialize the members bitmap */
+    size_t portable_size = roaring_bitmap_portable_size_in_bytes(entry->members);
+    bytea *serialized = (bytea *) palloc(VARHDRSZ + portable_size);
+    roaring_bitmap_portable_serialize(entry->members, VARDATA(serialized));
+    SET_VARSIZE(serialized, VARHDRSZ + portable_size);
+
+    Datum vals[2];
+    bool nulls[2] = {false, false};
+    vals[0] = PointerGetDatum(src_array);
+    vals[1] = PointerGetDatum(serialized);
+
+    HeapTuple tuple = heap_form_tuple(state->tupdesc, vals, nulls);
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+}
 
 //rb_from_bytea
 Datum rb_from_bytea(PG_FUNCTION_ARGS);
