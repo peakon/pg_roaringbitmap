@@ -1,4 +1,5 @@
 #include "roaringbitmap.h"
+#include "roaring_kmerge.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -128,6 +129,36 @@ ArrayContainsNulls(ArrayType *array) {
 }
 
 
+
+// rb_group_elements_by_source SRF
+PG_FUNCTION_INFO_V1(rb_group_elements_by_source);
+Datum rb_group_elements_by_source(PG_FUNCTION_ARGS);
+
+Datum
+rb_group_elements_by_source(PG_FUNCTION_ARGS)
+{
+    FuncCallContext *funcctx;
+    MemoryContext    oldcontext;
+
+    if (SRF_IS_FIRSTCALL())
+    {
+        ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+        funcctx = SRF_FIRSTCALL_INIT();
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+        funcctx->user_fctx = roaring_kmerge_build_state(arr, funcctx, fcinfo);
+
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+
+    HeapTuple tuple = roaring_kmerge_next_row((RoaringKMergeState *) funcctx->user_fctx);
+    if (tuple == NULL)
+        SRF_RETURN_DONE(funcctx);
+
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+}
 
 //rb_from_bytea
 Datum rb_from_bytea(PG_FUNCTION_ARGS);

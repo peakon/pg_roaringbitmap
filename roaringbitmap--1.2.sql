@@ -243,6 +243,11 @@ CREATE OR REPLACE FUNCTION rb_iterate(roaringbitmap)
    AS 'MODULE_PATHNAME', 'rb_iterate'
    LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
 
+CREATE OR REPLACE FUNCTION rb_group_elements_by_source(bitmaps roaringbitmap[])
+  RETURNS TABLE (sources int[], members roaringbitmap)
+  AS 'MODULE_PATHNAME', 'rb_group_elements_by_source'
+  LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
 CREATE OR REPLACE FUNCTION rb_runoptimize(roaringbitmap)
   RETURNS roaringbitmap
   AS 'MODULE_PATHNAME', 'rb_runoptimize'
