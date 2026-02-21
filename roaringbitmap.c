@@ -1,4 +1,5 @@
 #include "roaringbitmap.h"
+#include "hashmap.h"
 #include "utils/lsyscache.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -244,11 +245,36 @@ typedef struct KMGroupEntry
 
 typedef struct
 {
-    kmgroup_hash       *ht;
-    kmgroup_iterator    iter;
+    struct hashmap     *ht;
+    size_t              iter;
     int                 nwords;
     TupleDesc           tupdesc;
 } KMergeState;
+
+typedef struct {
+  size_t                *key;
+  size_t                 key_len;
+  roaring_bitmap_t      *members;
+  roaring_bulk_context_t bulk_ctx;
+} hashmap_entry_t;
+
+int hashmap_entry_compare(const void *a, const void *b, void *udata) {
+  const hashmap_entry_t *ea = (const hashmap_entry_t *)a;
+  const hashmap_entry_t *eb = (const hashmap_entry_t *)b;
+
+  if (ea->key_len < eb->key_len) {
+    return -1;
+  }
+  if (ea->key_len > eb->key_len) {
+    return 1;
+  }
+  return memcmp(ea->key, eb->key, ea->key_len * sizeof(size_t));
+}
+
+uint64_t hashmap_entry_hash(const void *entry, uint64_t seed0, uint64_t seed1) {
+  const hashmap_entry_t *e = (const hashmap_entry_t *)entry;
+  return hashmap_sip(e->key, e->key_len * sizeof(size_t), seed0, seed1);
+}
 
 Datum
 rb_kmerge(PG_FUNCTION_ARGS)
@@ -317,27 +343,24 @@ rb_kmerge(PG_FUNCTION_ARGS)
         if (heap_size > 1)
             km_heap_build(heap, heap_size);
 
-        /* Set up hash table for grouping by source-set */
-        KMGroupPrivate *priv =
-            (KMGroupPrivate *) palloc(sizeof(KMGroupPrivate));
-        priv->nwords = nwords;
-        kmgroup_hash *ht = kmgroup_create(funcctx->multi_call_memory_ctx,
-                                          256, priv);
+        // K-merge: group elements by source-set bitmask
+        struct hashmap *ht =
+            hashmap_new(sizeof(hashmap_entry_t), 0, 0, 0, hashmap_entry_hash,
+                        hashmap_entry_compare, NULL, NULL);
 
-        /* K-way merge: collect sources for each element, group in HT */
-        KMGroupKey bitmask;
-        memset(&bitmask, 0, sizeof(bitmask));
+        // Scratch buffer for building bitmask each iteration
+        size_t *bitmask_buf = (size_t *)palloc0(nwords * sizeof(size_t));
 
         while (heap_size > 0)
         {
             uint32 current_val = heap[0].value;
-            memset(bitmask.words, 0, nwords * sizeof(uint64));
+            memset(bitmask_buf, 0, nwords * sizeof(size_t));
 
             /* Collect all sources that contain current_val */
             do
             {
                 int src = heap[0].src;
-                bitmask.words[src / 64] |= ((uint64) 1) << (src % 64);
+                bitmask_buf[src / 64] |= ((uint64) 1) << (src % 64);
 
                 roaring_uint32_iterator_t *it = iters[src];
                 roaring_uint32_iterator_advance(it);
@@ -357,14 +380,21 @@ rb_kmerge(PG_FUNCTION_ARGS)
             while (heap_size > 0 && heap[0].value == current_val);
 
             /* Insert into the group for this source-set */
-            bool found;
-            KMGroupEntry *entry = kmgroup_insert(ht, bitmask, &found);
-            if (!found)
-            {
-                entry->members = roaring_bitmap_create();
-                memset(&entry->bulk_ctx, 0, sizeof(roaring_bulk_context_t));
+            hashmap_entry_t entry = {
+                .key = bitmask_buf, .key_len = nwords, .members = NULL, .bulk_ctx = {0}};
+            hashmap_entry_t *result = (hashmap_entry_t *)hashmap_get(ht, &entry);
+
+            if (!result) {
+                // Allocate a new copy of the key for this entry
+                size_t *key_copy = (size_t *)palloc(nwords * sizeof(size_t));
+                memcpy(key_copy, bitmask_buf, nwords * sizeof(size_t));
+                entry.key = key_copy;
+                entry.members = roaring_bitmap_create();
+                hashmap_set(ht, &entry);
+                result = (hashmap_entry_t *)hashmap_get(ht, &entry);
             }
-            roaring_bitmap_add_bulk(entry->members, &entry->bulk_ctx,
+
+            roaring_bitmap_add_bulk(result->members, &result->bulk_ctx,
                                     current_val);
         }
 
@@ -376,13 +406,13 @@ rb_kmerge(PG_FUNCTION_ARGS)
         }
         pfree(iters);
         pfree(heap);
+        pfree(bitmask_buf);
 
         /* Store HT and prepare iterator for per-call phase */
         KMergeState *state =
             (KMergeState *) palloc0(sizeof(KMergeState));
         state->ht = ht;
         state->nwords = nwords;
-        kmgroup_start_iterate(ht, &state->iter);
 
         TupleDesc tupdesc;
         if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -399,16 +429,18 @@ rb_kmerge(PG_FUNCTION_ARGS)
     funcctx = SRF_PERCALL_SETUP();
     KMergeState *state = (KMergeState *) funcctx->user_fctx;
 
-    KMGroupEntry *entry = kmgroup_iterate(state->ht, &state->iter);
-    if (entry == NULL)
+    void *item = 0;
+    if (!hashmap_iter(state->ht, &state->iter, &item))
         SRF_RETURN_DONE(funcctx);
+
+    hashmap_entry_t *entry = (hashmap_entry_t *)item;
 
     /* Convert bitmask to int[] of 1-based source indices (single pass) */
     Datum src_buf[KM_MAX_WORDS * 64];
     int nsources = 0;
-    for (int w = 0; w < KM_MAX_WORDS; w++)
+    for (int w = 0; w < entry->key_len; w++)
     {
-        uint64 v = entry->key.words[w];
+        size_t v = entry->key[w];
         int base = w * 64;
         while (v)
         {
