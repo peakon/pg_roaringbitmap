@@ -3,13 +3,20 @@ TESTS        = $(wildcard sql/*.sql)
 REGRESS      = $(patsubst sql/%.sql,%,$(TESTS))
 
 MODULE_big = roaringbitmap
-OBJS = roaring_buffer_reader.o roaringbitmap.o roaring64_buffer_reader.o roaringbitmap64.o hashmap.o
-
-$(OBJS): override CFLAGS += -std=c11 -Wno-error=maybe-uninitialized \
-	-Wno-declaration-after-statement -Wno-missing-prototypes
+OBJS = roaring_buffer_reader.o roaringbitmap.o roaring64_buffer_reader.o roaringbitmap64.o hashmap.o dummy_cpp.o
 
 PG_CONFIG = pg_config
 
 DATA = $(wildcard *--*.sql)
+
+CC = clang++
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+C_OBJS = roaring_buffer_reader.o roaringbitmap.o roaring64_buffer_reader.o roaringbitmap64.o hashmap.o
+
+$(C_OBJS): override CFLAGS := -x c $(CFLAGS) -Wno-error=maybe-uninitialized \
+	-Wno-declaration-after-statement -Wno-missing-prototypes
+
+%.o: %.cpp
+	$(CC) -std=c++11 $(CPPFLAGS) $(PG_CPPFLAGS) $(CFLAGS_SL) -I$(srcdir) -c $< -o $@

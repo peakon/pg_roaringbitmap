@@ -1,6 +1,7 @@
 #include "roaringbitmap.h"
 #include "hashmap.h"
 #include "utils/lsyscache.h"
+#include "dummy_cpp.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -92,6 +93,8 @@ _PG_init(void)
                              NULL,
                              NULL);
     roaring_init_memory_hook(rb_memory_hook);
+
+    dummy_cpp_function(42);
 }
 
 
