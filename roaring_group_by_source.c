@@ -11,85 +11,12 @@
  */
 
 #include "roaring_group_by_source.h"
+#include "roaring_group_by_source_common.h"
 
 #include <stdint.h>
 
 #include "roaringbitmap.h"
 #include "utils/lsyscache.h"
-
-typedef struct roaring_group_by_source_heap_node_s {
-    int src;        // 0-based index of iterator into the input bitmap array
-    uint32_t value; // iterator's current value
-} roaring_group_by_source_heap_node_t;
-
-static inline void roaring_group_by_source_heap_sift_down(
-    roaring_group_by_source_heap_node_t *heap, int size, int idx) {
-    for (;;) {
-        int left = (idx << 1) + 1;
-        if (left >= size)
-            break;
-        int right = left + 1;
-        int smallest = left;
-        if (right < size && heap[right].value < heap[left].value)
-            smallest = right;
-        if (!(heap[smallest].value < heap[idx].value))
-            break;
-        roaring_group_by_source_heap_node_t tmp = heap[idx];
-        heap[idx] = heap[smallest];
-        heap[smallest] = tmp;
-        idx = smallest;
-    }
-}
-
-static inline void
-roaring_group_by_source_heap_build(roaring_group_by_source_heap_node_t *heap,
-                                   int size) {
-    for (int i = (size >> 1) - 1; i >= 0; i--)
-        roaring_group_by_source_heap_sift_down(heap, size, i);
-}
-
-static inline uint32_t roaring_group_by_source_hash_key(const uint64_t *words,
-                                                        int nwords) {
-    uint64_t h = 0;
-    for (int i = 0; i < nwords; i++) {
-        h ^= words[i];
-        h ^= h >> 30;
-        h *= 0xbf58476d1ce4e5b9ULL;
-        h ^= h >> 27;
-        h *= 0x94d049bb133111ebULL;
-        h ^= h >> 31;
-    }
-    return (uint32_t)h;
-}
-
-typedef struct roaring_group_by_source_group_private_s {
-    int nwords;
-} roaring_group_by_source_group_private_t;
-
-typedef struct roaring_group_by_source_group_entry_s {
-    uint64_t *key; // palloc'd bitmask of input bitmaps indexes
-    roaring_bitmap_t *members;
-    roaring_bulk_context_t bulk_ctx;
-    char status; // required by simplehash
-} roaring_group_by_source_group_entry_t;
-
-#define SH_PREFIX roaring_group_by_source_group
-#define SH_ELEMENT_TYPE roaring_group_by_source_group_entry_t
-#define SH_KEY_TYPE uint64_t *
-#define SH_KEY key
-#define SH_HASH_KEY(tb, k)                                                     \
-    roaring_group_by_source_hash_key(                                          \
-        (k), ((roaring_group_by_source_group_private_t *)(tb)->private_data)   \
-                 ->nwords)
-#define SH_EQUAL(tb, a, b)                                                     \
-    (memcmp((a), (b),                                                          \
-            ((roaring_group_by_source_group_private_t *)(tb)->private_data)    \
-                    ->nwords *                                                 \
-                sizeof(uint64_t)) == 0)
-#define SH_SCOPE static inline
-#define SH_DECLARE
-#define SH_DEFINE
-#include "lib/simplehash.h"
 
 /**
  * Internal state for roaring_group_by_source_next_row()
@@ -164,7 +91,7 @@ static void roaring_group_by_source_run_merge(
     uint64_t *bitmask = (uint64_t *)palloc0(nwords * sizeof(uint64_t));
 
     while (heap_size > 0) {
-        uint32_t current_val = heap[0].value;
+        uint32_t current_val = (uint32_t)heap[0].value;
         memset(bitmask, 0, nwords * sizeof(uint64_t));
 
         // Write the indexes of iters that contain current_val into the bitmask
@@ -291,21 +218,8 @@ roaring_group_by_source_next_row(roaring_group_by_source_state_t *state) {
         return NULL;
 
     // Convert bitmask to int[] of 1-based source indices
-    int max_sources = state->nwords * 64;
-    Datum *src_buf = (Datum *)palloc(max_sources * sizeof(Datum));
-    int nsources = 0;
-    for (int w = 0; w < state->nwords; w++) {
-        uint64_t v = entry->key[w];
-        int base = w * 64;
-        while (v) {
-            int bitpos = roaring_trailing_zeroes(v);
-            src_buf[nsources++] = Int32GetDatum(base + bitpos + 1);
-            v &= v - 1;
-        }
-    }
-    ArrayType *src_array =
-        construct_array(src_buf, nsources, INT4OID, sizeof(int32_t), true, 'i');
-    pfree(src_buf);
+    ArrayType *src_array = roaring_group_by_source_bitmask_to_sources_array(
+        entry->key, state->nwords);
 
     // Serialize the members bitmap
     size_t portable_size =
