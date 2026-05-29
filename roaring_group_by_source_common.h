@@ -5,12 +5,23 @@
  * Type-independent cold-path bits shared between the 32-bit and 64-bit
  * implementations of rb_group_elements_by_source.
  *
- * The simplehash specialisation lives in this header with SH_SCOPE
- * static inline so each translation unit that includes the header gets
- * its own private static-inline copies. This is intentional — there
- * are only two callers (the 32-bit and 64-bit variants) and the cost
- * of duplicate static-inline copies is negligible relative to the
- * simplicity of not having to manage exported template instantiations.
+ * The simplehash specialisation is templated per consuming translation
+ * unit via roaring_group_by_source_hash_template.h.  Each consumer
+ * predefines three preprocessor parameters and then #includes the
+ * template header, which emits the entry struct, configures the SH_*
+ * macros, pulls in lib/simplehash.h, and #undefs its parameters so it
+ * can be re-included.  Each consumer picks its own SH_PREFIX, so the
+ * 32-bit and 64-bit variants do not collide; SH_SCOPE static inline
+ * keeps the duplication cost negligible.
+ *
+ * Typical usage in a .c file:
+ *
+ *   #include "roaring_group_by_source_common.h"
+ *
+ *   #define RB_GROUP_BY_SOURCE_HASH_PREFIX        roaring_group_by_source_group
+ *   #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE  roaring_bitmap_t *
+ *   #define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring_bulk_context_t
+ *   #include "roaring_group_by_source_hash_template.h"
  */
 
 #include "postgres.h"
@@ -75,34 +86,14 @@ static inline uint32_t roaring_group_by_source_hash_key(const uint64_t *words,
     return (uint32_t)h;
 }
 
+/**
+ * Type-independent private_data carried on the simplehash table.  Both
+ * the 32-bit and 64-bit specialisations share this struct since it only
+ * carries nwords.
+ */
 typedef struct roaring_group_by_source_group_private_s {
     int nwords;
 } roaring_group_by_source_group_private_t;
-
-typedef struct roaring_group_by_source_group_entry_s {
-    uint64_t *key; // palloc'd bitmask of input bitmaps indexes
-    roaring_bitmap_t *members;
-    roaring_bulk_context_t bulk_ctx;
-    char status; // required by simplehash
-} roaring_group_by_source_group_entry_t;
-
-#define SH_PREFIX roaring_group_by_source_group
-#define SH_ELEMENT_TYPE roaring_group_by_source_group_entry_t
-#define SH_KEY_TYPE uint64_t *
-#define SH_KEY key
-#define SH_HASH_KEY(tb, k)                                                     \
-    roaring_group_by_source_hash_key(                                          \
-        (k), ((roaring_group_by_source_group_private_t *)(tb)->private_data)   \
-                 ->nwords)
-#define SH_EQUAL(tb, a, b)                                                     \
-    (memcmp((a), (b),                                                          \
-            ((roaring_group_by_source_group_private_t *)(tb)->private_data)    \
-                    ->nwords *                                                 \
-                sizeof(uint64_t)) == 0)
-#define SH_SCOPE static inline
-#define SH_DECLARE
-#define SH_DEFINE
-#include "lib/simplehash.h"
 
 /**
  * Convert a packed bitmask into a Postgres ArrayType containing the 1-based

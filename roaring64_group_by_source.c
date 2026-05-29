@@ -1,16 +1,21 @@
 /**
- * Implements rb_group_elements_by_source(bitmaps roaringbitmap[]).
+ * Implements rb64_group_elements_by_source(bitmaps roaringbitmap64[]).
  *
- * Given N bitmaps, performs a k-way merge and groups elements by which
- * combination of input bitmaps contains them.
+ * Given N 64-bit bitmaps, performs a k-way merge and groups elements by
+ * which combination of input bitmaps contains them.
  *
  * Returns a set of rows with the following columns:
- *   sources int[]         – 1-based indices of input bitmaps
- *   members roaringbitmap – all elements contained in this combination of input
- *                           bitmaps
+ *   sources int[]           – 1-based indices of input bitmaps
+ *   members roaringbitmap64 – all elements contained in this combination
+ *                             of input bitmaps
+ *
+ * This is the 64-bit mirror of roaring_group_by_source.c; it shares the
+ * cold-path heap, hash, and bitmask-to-sources helpers via
+ * roaring_group_by_source_common.h and emits its own simplehash
+ * specialisation via roaring_group_by_source_hash_template.h.
  */
 
-#include "roaring_group_by_source.h"
+#include "roaring64_group_by_source.h"
 #include "roaring_group_by_source_common.h"
 
 #include <stdint.h>
@@ -19,38 +24,38 @@
 #include "utils/lsyscache.h"
 
 /*
- * Instantiate the 32-bit simplehash specialisation.  See
+ * Instantiate the 64-bit simplehash specialisation.  See
  * roaring_group_by_source_hash_template.h for the parameter contract.
  */
-#define RB_GROUP_BY_SOURCE_HASH_PREFIX roaring_group_by_source_group
-#define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE roaring_bitmap_t *
-#define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring_bulk_context_t
+#define RB_GROUP_BY_SOURCE_HASH_PREFIX roaring64_group_by_source_group
+#define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE roaring64_bitmap_t *
+#define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring64_bulk_context_t
 #include "roaring_group_by_source_hash_template.h"
 
 /**
- * Internal state for roaring_group_by_source_next_row()
+ * Internal state for roaring64_group_by_source_next_row()
  */
-struct roaring_group_by_source_state_s {
-    roaring_group_by_source_group_hash *ht;
-    roaring_group_by_source_group_iterator iter;
+struct roaring64_group_by_source_state_s {
+    roaring64_group_by_source_group_hash *ht;
+    roaring64_group_by_source_group_iterator iter;
     int nwords;
     TupleDesc tupdesc;
 };
 
 /**
- * roaring_group_by_source_deserialize:
+ * roaring64_group_by_source_deserialize:
  * deserialises each non-null element of the Datum array into bitmaps[].
  * NULL slots are left as NULL in bitmaps[].
  */
-static void roaring_group_by_source_deserialize(int nelems,
-                                                const Datum *elem_values,
-                                                const bool *elem_nulls,
-                                                roaring_bitmap_t **bitmaps) {
+static void
+roaring64_group_by_source_deserialize(int nelems, const Datum *elem_values,
+                                      const bool *elem_nulls,
+                                      roaring64_bitmap_t **bitmaps) {
     for (int i = 0; i < nelems; i++) {
         if (elem_nulls[i])
             continue;
         bytea *data = (bytea *)PG_DETOAST_DATUM(elem_values[i]);
-        bitmaps[i] = roaring_bitmap_portable_deserialize_safe(
+        bitmaps[i] = roaring64_bitmap_portable_deserialize_safe(
             VARDATA(data), VARSIZE(data) - VARHDRSZ);
         if (!bitmaps[i])
             ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -59,23 +64,23 @@ static void roaring_group_by_source_deserialize(int nelems,
 }
 
 /**
- * roaring_group_by_source_build_iterators:
+ * roaring64_group_by_source_build_iterators:
  * creates an iterator for each non-null bitmap and seeds the min-heap in
  * preparation for the k-way merge.
  */
-static void roaring_group_by_source_build_iterators(
-    int nelems, roaring_bitmap_t **bitmaps, roaring_uint32_iterator_t **iters,
+static void roaring64_group_by_source_build_iterators(
+    int nelems, roaring64_bitmap_t **bitmaps, roaring64_iterator_t **iters,
     roaring_group_by_source_heap_node_t *heap, int *heap_size_out) {
     int heap_size = 0;
 
     for (int i = 0; i < nelems; i++) {
         if (!bitmaps[i])
             continue;
-        roaring_uint32_iterator_t *it = roaring_iterator_create(bitmaps[i]);
+        roaring64_iterator_t *it = roaring64_iterator_create(bitmaps[i]);
         iters[i] = it;
-        if (it->has_value) {
+        if (roaring64_iterator_has_value(it)) {
             heap[heap_size].src = i;
-            heap[heap_size].value = it->current_value;
+            heap[heap_size].value = roaring64_iterator_value(it);
             heap_size++;
         }
     }
@@ -87,20 +92,19 @@ static void roaring_group_by_source_build_iterators(
 }
 
 /**
- * roaring_group_by_source_run_merge:
- * k-way merge loop, for each unique value, builds a bitmask of source iterators
- * containing it, looks up the bitmask in the hash table, and adds the value to
- * the corresponding members.
+ * roaring64_group_by_source_run_merge:
+ * k-way merge loop; for each unique value, builds a bitmask of source
+ * iterators containing it, looks up the bitmask in the hash table, and
+ * adds the value to the corresponding members.
  */
-static void roaring_group_by_source_run_merge(
-    roaring_uint32_iterator_t **iters,
-    roaring_group_by_source_heap_node_t *heap, int heap_size,
-    roaring_group_by_source_group_hash *ht, int nwords) {
+static void roaring64_group_by_source_run_merge(
+    roaring64_iterator_t **iters, roaring_group_by_source_heap_node_t *heap,
+    int heap_size, roaring64_group_by_source_group_hash *ht, int nwords) {
     // Reusable scratch buffer for the current element's source-set bitmask
     uint64_t *bitmask = (uint64_t *)palloc0(nwords * sizeof(uint64_t));
 
     while (heap_size > 0) {
-        uint32_t current_val = (uint32_t)heap[0].value;
+        uint64_t current_val = heap[0].value;
         memset(bitmask, 0, nwords * sizeof(uint64_t));
 
         // Write the indexes of iters that contain current_val into the bitmask
@@ -108,10 +112,10 @@ static void roaring_group_by_source_run_merge(
             int src = heap[0].src;
             bitmask[src / 64] |= ((uint64_t)1) << (src % 64);
 
-            roaring_uint32_iterator_t *it = iters[src];
-            roaring_uint32_iterator_advance(it);
-            if (it->has_value) {
-                heap[0].value = it->current_value;
+            roaring64_iterator_t *it = iters[src];
+            roaring64_iterator_advance(it);
+            if (roaring64_iterator_has_value(it)) {
+                heap[0].value = roaring64_iterator_value(it);
                 roaring_group_by_source_heap_sift_down(heap, heap_size, 0);
             } else {
                 heap[0] = heap[heap_size - 1];
@@ -124,29 +128,30 @@ static void roaring_group_by_source_run_merge(
         // Look up the bitmask in the hash table and add current_val to the
         // corresponding members bitmap, creating a new entry if not found
         bool found;
-        roaring_group_by_source_group_entry_t *entry =
-            roaring_group_by_source_group_insert(ht, bitmask, &found);
+        roaring64_group_by_source_group_entry_t *entry =
+            roaring64_group_by_source_group_insert(ht, bitmask, &found);
         if (!found) {
             uint64_t *key_copy = (uint64_t *)palloc(nwords * sizeof(uint64_t));
             memcpy(key_copy, bitmask, nwords * sizeof(uint64_t));
             entry->key = key_copy;
-            entry->members = roaring_bitmap_create();
-            memset(&entry->bulk_ctx, 0, sizeof(roaring_bulk_context_t));
+            entry->members = roaring64_bitmap_create();
+            memset(&entry->bulk_ctx, 0, sizeof(roaring64_bulk_context_t));
         }
         /* entry remains valid for this iteration; the next insert may grow the
          * table, invalidating it. */
-        /* roaring_bitmap_add_bulk requires strictly ascending insertion order,
-         * which is guaranteed here because current_val is always the heap
-         * minimum. */
-        roaring_bitmap_add_bulk(entry->members, &entry->bulk_ctx, current_val);
+        /* roaring64_bitmap_add_bulk requires strictly ascending insertion
+         * order, which is guaranteed here because current_val is always the
+         * heap minimum. */
+        roaring64_bitmap_add_bulk(entry->members, &entry->bulk_ctx,
+                                  current_val);
     }
 
     pfree(bitmask);
 }
 
-roaring_group_by_source_state_t *
-roaring_group_by_source_build_state(ArrayType *arr, FuncCallContext *funcctx,
-                                    FunctionCallInfo fcinfo) {
+roaring64_group_by_source_state_t *
+roaring64_group_by_source_build_state(ArrayType *arr, FuncCallContext *funcctx,
+                                      FunctionCallInfo fcinfo) {
     int16_t elmlen;
     bool elmbyval;
     char elmalign;
@@ -164,38 +169,38 @@ roaring_group_by_source_build_state(ArrayType *arr, FuncCallContext *funcctx,
         nwords = 1;
 
     int n = Max(nelems, 1);
-    roaring_bitmap_t **bitmaps =
-        (roaring_bitmap_t **)palloc0(sizeof(roaring_bitmap_t *) * n);
-    roaring_uint32_iterator_t **iters = (roaring_uint32_iterator_t **)palloc0(
-        sizeof(roaring_uint32_iterator_t *) * n);
+    roaring64_bitmap_t **bitmaps =
+        (roaring64_bitmap_t **)palloc0(sizeof(roaring64_bitmap_t *) * n);
+    roaring64_iterator_t **iters =
+        (roaring64_iterator_t **)palloc0(sizeof(roaring64_iterator_t *) * n);
     roaring_group_by_source_heap_node_t *heap =
         (roaring_group_by_source_heap_node_t *)palloc(
             sizeof(roaring_group_by_source_heap_node_t) * n);
     int heap_size;
 
-    roaring_group_by_source_deserialize(nelems, elem_values, elem_nulls,
-                                        bitmaps);
+    roaring64_group_by_source_deserialize(nelems, elem_values, elem_nulls,
+                                          bitmaps);
     pfree(elem_values);
     pfree(elem_nulls);
-    roaring_group_by_source_build_iterators(nelems, bitmaps, iters, heap,
-                                            &heap_size);
+    roaring64_group_by_source_build_iterators(nelems, bitmaps, iters, heap,
+                                              &heap_size);
 
     roaring_group_by_source_group_private_t *priv =
         (roaring_group_by_source_group_private_t *)palloc(
             sizeof(roaring_group_by_source_group_private_t));
     priv->nwords = nwords;
 
-    roaring_group_by_source_group_hash *ht =
-        roaring_group_by_source_group_create(funcctx->multi_call_memory_ctx,
-                                             256, priv);
+    roaring64_group_by_source_group_hash *ht =
+        roaring64_group_by_source_group_create(funcctx->multi_call_memory_ctx,
+                                               256, priv);
 
-    roaring_group_by_source_run_merge(iters, heap, heap_size, ht, nwords);
+    roaring64_group_by_source_run_merge(iters, heap, heap_size, ht, nwords);
 
     for (int i = 0; i < nelems; i++) {
         if (iters[i])
-            roaring_uint32_iterator_free(iters[i]);
+            roaring64_iterator_free(iters[i]);
         if (bitmaps[i])
-            roaring_bitmap_free(bitmaps[i]);
+            roaring64_bitmap_free(bitmaps[i]);
     }
     pfree(bitmaps);
     pfree(iters);
@@ -207,22 +212,22 @@ roaring_group_by_source_build_state(ArrayType *arr, FuncCallContext *funcctx,
                         errmsg("return type must be a row type")));
     BlessTupleDesc(tupdesc);
 
-    roaring_group_by_source_state_t *state =
-        (roaring_group_by_source_state_t *)palloc0(
-            sizeof(roaring_group_by_source_state_t));
+    roaring64_group_by_source_state_t *state =
+        (roaring64_group_by_source_state_t *)palloc0(
+            sizeof(roaring64_group_by_source_state_t));
 
     state->ht = ht;
     state->nwords = nwords;
     state->tupdesc = tupdesc;
-    roaring_group_by_source_group_start_iterate(ht, &state->iter);
+    roaring64_group_by_source_group_start_iterate(ht, &state->iter);
 
     return state;
 }
 
 HeapTuple
-roaring_group_by_source_next_row(roaring_group_by_source_state_t *state) {
-    roaring_group_by_source_group_entry_t *entry =
-        roaring_group_by_source_group_iterate(state->ht, &state->iter);
+roaring64_group_by_source_next_row(roaring64_group_by_source_state_t *state) {
+    roaring64_group_by_source_group_entry_t *entry =
+        roaring64_group_by_source_group_iterate(state->ht, &state->iter);
     if (entry == NULL)
         return NULL;
 
@@ -232,9 +237,9 @@ roaring_group_by_source_next_row(roaring_group_by_source_state_t *state) {
 
     // Serialize the members bitmap
     size_t portable_size =
-        roaring_bitmap_portable_size_in_bytes(entry->members);
+        roaring64_bitmap_portable_size_in_bytes(entry->members);
     bytea *serialized = (bytea *)palloc(VARHDRSZ + portable_size);
-    roaring_bitmap_portable_serialize(entry->members, VARDATA(serialized));
+    roaring64_bitmap_portable_serialize(entry->members, VARDATA(serialized));
     SET_VARSIZE(serialized, VARHDRSZ + portable_size);
 
     Datum vals[2] = {PointerGetDatum(src_array), PointerGetDatum(serialized)};
