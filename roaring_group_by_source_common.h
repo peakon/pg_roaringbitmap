@@ -143,10 +143,8 @@ roaring_group_by_source_bitmask_to_sources_array(const uint64_t *key,
 #define RB_GROUP_BY_SOURCE_HASH_PASTE(a, b) RB_GROUP_BY_SOURCE_HASH_PASTE_(a, b)
 #define RB_GROUP_BY_SOURCE_HASH_ENTRY_T                                        \
     RB_GROUP_BY_SOURCE_HASH_PASTE(RB_GROUP_BY_SOURCE_HASH_PREFIX, _entry_t)
-#define RB_GROUP_BY_SOURCE_HASH_ENTRY_S                                        \
-    RB_GROUP_BY_SOURCE_HASH_PASTE(RB_GROUP_BY_SOURCE_HASH_PREFIX, _entry_s)
 
-typedef struct RB_GROUP_BY_SOURCE_HASH_ENTRY_S {
+typedef struct {
     uint64_t *key; /* palloc'd bitmask of input bitmap indexes */
     RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE members;
     RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE bulk_ctx;
@@ -177,6 +175,5 @@ typedef struct RB_GROUP_BY_SOURCE_HASH_ENTRY_S {
 #undef RB_GROUP_BY_SOURCE_HASH_PASTE_
 #undef RB_GROUP_BY_SOURCE_HASH_PASTE
 #undef RB_GROUP_BY_SOURCE_HASH_ENTRY_T
-#undef RB_GROUP_BY_SOURCE_HASH_ENTRY_S
 
 #endif /* RB_GROUP_BY_SOURCE_HASH_PREFIX */
