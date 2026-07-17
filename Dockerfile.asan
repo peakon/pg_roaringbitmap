@@ -1,0 +1,100 @@
+# Postgres + pg_roaringbitmap built with AddressSanitizer, for catching
+# memory bugs (use-after-free, buffer overflow, leaks) while running the
+# regression tests or the benchmark scripts.
+#
+# Build:
+#   docker build -f Dockerfile.asan -t pg_roaringbitmap-asan .
+#
+# Run (foreground, logs to stdout so ASan reports are visible):
+#   docker run --rm -it pg_roaringbitmap-asan
+#
+# Run the benchmark against it from another shell:
+#   docker exec -it <container> bash -c \
+#     "cd /pg_roaringbitmap/benchmark && ./benchmark.sh -h localhost -U postgres"
+#
+# ASan aborts the backend process on the first detected error and prints a
+# report to the postgres log (stderr), which docker run -it shows directly.
+
+FROM debian:bookworm AS builder
+ARG PG_VERSION=18.1
+
+RUN apt-get update && apt-get install -y \
+      build-essential curl ca-certificates pkg-config \
+      bison flex \
+      libreadline-dev zlib1g-dev libssl-dev libicu-dev \
+      clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src
+RUN curl -L "https://github.com/postgres/postgres/archive/refs/tags/REL_${PG_VERSION%%.*}_${PG_VERSION#*.}.tar.gz" \
+      -o postgresql.tar.gz \
+    && tar xzf postgresql.tar.gz \
+    && mv postgres-REL_${PG_VERSION%%.*}_${PG_VERSION#*.} postgresql-${PG_VERSION}
+
+WORKDIR /usr/src/postgresql-${PG_VERSION}
+# -fsanitize=address: instrument all reads/writes for out-of-bounds and
+#   use-after-free detection.
+# -O0 -g: keep stack traces accurate; ASan works better without optimizer
+#   reordering.
+# --enable-cassert: turn on Postgres's own assertions too, since these often
+#   catch the same class of bug earlier/clearer than ASan does.
+RUN CC=clang CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O0" \
+    LDFLAGS="-fsanitize=address" ASAN_OPTIONS="detect_leaks=0" \
+    ./configure --prefix=/usr/local/pgsql --enable-cassert \
+    && make -j$(nproc) \
+    && make install
+
+WORKDIR /pg_roaringbitmap
+COPY . .
+# ASAN_OPTIONS=detect_leaks=0 here: pg_config itself is ASan-instrumented
+# (built as part of the PG toolchain above) and has known startup leaks
+# that would otherwise abort every invocation of pg_config the Makefile
+# makes while building this extension. We only care about leaks in the
+# running backend, set via ASAN_OPTIONS in the final image below.
+RUN PATH="/usr/local/pgsql/bin:$PATH" CC=clang \
+    CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O0" \
+    ASAN_OPTIONS="detect_leaks=0" \
+    make PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+    && PATH="/usr/local/pgsql/bin:$PATH" ASAN_OPTIONS="detect_leaks=0" \
+    make install PG_CONFIG=/usr/local/pgsql/bin/pg_config
+
+FROM debian:bookworm
+RUN apt-get update && apt-get install -y \
+      libreadline8 libssl3 libicu72 zlib1g \
+      clang \
+    && rm -rf /var/lib/apt/lists/*
+# clang provides llvm-symbolizer, needed for ASan to print readable stack
+# traces instead of raw addresses.
+
+COPY --from=builder /usr/local/pgsql /usr/local/pgsql
+
+# Every Postgres backend intentionally leaks a small buffer in
+# save_ps_display_args (src/backend/utils/misc/ps_status.c) for the process
+# lifetime, used to set the "ps" title. This trips LeakSanitizer on every
+# single backend/startup process, so suppress it by name -- otherwise no
+# leak-detection run can get past the first connection.
+RUN echo "leak:save_ps_display_args" > /usr/local/pgsql/lsan.supp
+
+ENV PATH="/usr/local/pgsql/bin:${PATH}"
+# detect_leaks=0: leave leak detection off by default so ASan focuses on
+# memory-safety errors (overflow, use-after-free) day to day. Enable it for
+# a dedicated leak-detection run with:
+#   docker run \
+#     -e ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:symbolize=1 \
+#     -e LSAN_OPTIONS=suppressions=/usr/local/pgsql/lsan.supp \
+#     ...
+ENV ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:symbolize=1"
+ENV PGDATA=/var/lib/postgresql/data
+
+RUN useradd -m postgres \
+    && mkdir -p "$PGDATA" \
+    && chown -R postgres:postgres /var/lib/postgresql /usr/local/pgsql
+
+USER postgres
+RUN initdb -D "$PGDATA" \
+    && echo "shared_preload_libraries = ''" >> "$PGDATA/postgresql.conf" \
+    && echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf" \
+    && echo "listen_addresses = '*'" >> "$PGDATA/postgresql.conf"
+
+EXPOSE 5432
+CMD ["postgres", "-D", "/var/lib/postgresql/data"]

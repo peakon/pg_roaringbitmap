@@ -1,0 +1,69 @@
+# Postgres + pg_roaringbitmap, plain build (no sanitizer), for running under
+# Valgrind memcheck. ASan and Valgrind both intercept malloc/free and can't
+# be used together, so this is a separate image from Dockerfile.asan.
+#
+# Build:
+#   docker build -f Dockerfile.valgrind -t pg_roaringbitmap-valgrind .
+#
+# Run postgres itself under valgrind (single-shot, foreground):
+#   docker run --rm --entrypoint bash pg_roaringbitmap-valgrind -c \
+#     "valgrind --tool=memcheck --leak-check=full --track-origins=yes \
+#        postgres -D /var/lib/postgresql/data"
+#
+# debian:trixie is used (rather than bookworm, matching Dockerfile.asan)
+# because it ships valgrind 3.24. Bookworm's bundled valgrind (3.19) has a
+# DWARF/CFI-reader bug ("unhandled DW_OP_ opcode" / assertion failure in
+# copy_convert_CfiExpr_tree) that aborts valgrind itself before postgres
+# even starts, when reading debug info emitted by bookworm's gcc/glibc.
+
+FROM debian:trixie AS builder
+ARG PG_VERSION=18.1
+
+RUN apt-get update && apt-get install -y \
+      build-essential curl ca-certificates pkg-config \
+      bison flex \
+      libreadline-dev zlib1g-dev libssl-dev libicu-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src
+RUN curl -L "https://github.com/postgres/postgres/archive/refs/tags/REL_${PG_VERSION%%.*}_${PG_VERSION#*.}.tar.gz" \
+      -o postgresql.tar.gz \
+    && tar xzf postgresql.tar.gz \
+    && mv postgres-REL_${PG_VERSION%%.*}_${PG_VERSION#*.} postgresql-${PG_VERSION}
+
+WORKDIR /usr/src/postgresql-${PG_VERSION}
+# --enable-cassert: keep Postgres's own assertions on; -g -O0: accurate
+# valgrind stack traces without optimizer reordering.
+RUN CFLAGS="-g -O0" ./configure --prefix=/usr/local/pgsql --enable-cassert \
+    && make -j$(nproc) \
+    && make install
+
+WORKDIR /pg_roaringbitmap
+COPY . .
+RUN PATH="/usr/local/pgsql/bin:$PATH" CFLAGS="-g -O0" \
+    make PG_CONFIG=/usr/local/pgsql/bin/pg_config \
+    && PATH="/usr/local/pgsql/bin:$PATH" \
+    make install PG_CONFIG=/usr/local/pgsql/bin/pg_config
+
+FROM debian:trixie
+RUN apt-get update && apt-get install -y \
+      libreadline8 libssl3 libicu76 zlib1g valgrind \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/pgsql /usr/local/pgsql
+
+ENV PATH="/usr/local/pgsql/bin:${PATH}"
+ENV PGDATA=/var/lib/postgresql/data
+
+RUN useradd -m postgres \
+    && mkdir -p "$PGDATA" \
+    && chown -R postgres:postgres /var/lib/postgresql /usr/local/pgsql
+
+USER postgres
+RUN initdb -D "$PGDATA" \
+    && echo "shared_preload_libraries = ''" >> "$PGDATA/postgresql.conf" \
+    && echo "host all all 0.0.0.0/0 trust" >> "$PGDATA/pg_hba.conf" \
+    && echo "listen_addresses = '*'" >> "$PGDATA/postgresql.conf"
+
+EXPOSE 5432
+CMD ["postgres", "-D", "/var/lib/postgresql/data"]
