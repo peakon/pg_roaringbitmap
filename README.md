@@ -29,6 +29,113 @@ Note: You can use `make -f Makefile_native` instead of `make` to let the compile
 
 	make installcheck
 
+## Memory-safety testing (ASan / Valgrind)
+
+Two Docker images are provided for catching memory bugs (heap overflows,
+use-after-free, leaks) in the extension's C code: `Dockerfile.asan` builds
+Postgres + the extension with AddressSanitizer, and `Dockerfile.valgrind`
+builds a plain (non-instrumented) copy for running under Valgrind
+memcheck. They're separate images because ASan and Valgrind both
+intercept `malloc`/`free` and can't be combined in one binary.
+
+### AddressSanitizer
+
+Build and start the image:
+
+	docker build -f Dockerfile.asan -t pg_roaringbitmap-asan .
+	docker run --rm -d --name pgasan pg_roaringbitmap-asan
+
+Create a database and the extension, then run a query. `psql` itself is
+also ASan-instrumented and has its own unrelated startup leaks, so pass
+`-e ASAN_OPTIONS=detect_leaks=0` on `docker exec` to keep those out of the
+way — the server process (where the extension code actually runs) keeps
+leak detection off by default too, for the same reason (see below):
+
+	docker exec -u postgres pgasan psql -c "create database rbtest"
+	docker exec -u postgres -e ASAN_OPTIONS="detect_leaks=0" pgasan \
+	  psql -d rbtest -c "create extension roaringbitmap"
+	docker exec -u postgres -e ASAN_OPTIONS="detect_leaks=0" pgasan \
+	  psql -d rbtest -c "select rb_cardinality(rb_build(ARRAY[1,2,3]))"
+
+If ASan detects a memory-safety error (buffer overflow, use-after-free,
+etc.) in a backend, that backend aborts and prints a report to the
+container's log:
+
+	docker logs pgasan
+
+To run the regression suite or the benchmark scripts against the
+instrumented server, copy them in and run as usual:
+
+	docker cp sql pgasan:/tmp/sql
+	docker cp benchmark pgasan:/tmp/benchmark
+	docker exec -u postgres -e ASAN_OPTIONS="detect_leaks=0" pgasan \
+	  psql -d rbtest -f /tmp/sql/roaringbitmap.sql
+	docker exec -u postgres -e ASAN_OPTIONS="detect_leaks=0" pgasan \
+	  bash -c "cd /tmp/benchmark && psql -d rbtest -f benchmark.sql"
+
+Leak detection is off by default because every Postgres backend
+intentionally leaks a small buffer in `save_ps_display_args` (used for
+the `ps` process title) for its whole lifetime, which would otherwise
+trip ASan on every single connection. To run a dedicated leak-detection
+pass, re-enable it and point at the bundled suppression for that one
+known leak:
+
+	docker run --rm -d --name pgasan_leak \
+	  -e ASAN_OPTIONS="detect_leaks=1:abort_on_error=1:symbolize=1" \
+	  -e LSAN_OPTIONS="suppressions=/usr/local/pgsql/lsan.supp" \
+	  pg_roaringbitmap-asan
+	docker exec -u postgres pgasan_leak psql -c "create database rbtest"
+	docker exec -u postgres -e ASAN_OPTIONS="detect_leaks=0" pgasan_leak \
+	  psql -d rbtest -c "create extension roaringbitmap"
+	docker exec -u postgres -e ASAN_OPTIONS="detect_leaks=0" pgasan_leak \
+	  psql -d rbtest -c "select rb_cardinality(rb_build(ARRAY[1,2,3]))"
+	docker logs pgasan_leak   # any new leak (beyond the suppressed one) shows up here
+
+Stop the container when done:
+
+	docker stop pgasan
+
+### Valgrind
+
+Build and run `postgres` itself under `valgrind --tool=memcheck` in the
+foreground:
+
+	docker build -f Dockerfile.valgrind -t pg_roaringbitmap-valgrind .
+	docker run --rm -d --name pgvg --entrypoint bash pg_roaringbitmap-valgrind -c \
+	  "valgrind --tool=memcheck --leak-check=full --track-origins=yes \
+	     --log-file=/tmp/valgrind-%p.log \
+	     postgres -D /var/lib/postgresql/data"
+
+Wait for it to report ready, then connect and run a query as usual (no
+special `ASAN_OPTIONS`/env needed here — this is a plain, uninstrumented
+`psql` talking to a valgrind-wrapped server):
+
+	docker exec -u postgres pgvg psql -c "create database rbtest"
+	docker exec -u postgres pgvg psql -d rbtest -c "create extension roaringbitmap"
+	docker exec -u postgres pgvg psql -d rbtest -c "select rb_cardinality(rb_build(ARRAY[1,2,3]))"
+
+Each backend process gets its own log (`/tmp/valgrind-<pid>.log` inside
+the container); find the one for the connection you care about and
+inspect it:
+
+	docker exec pgvg ls -la /tmp/valgrind-*.log
+	docker exec pgvg cat /tmp/valgrind-<pid>.log
+
+A clean run shows only one known, benign leak (the same
+`save_ps_display_args` allocation mentioned above) and `ERROR SUMMARY: 1
+errors from 1 contexts`. Any additional invalid read/write or extra
+leaked block reported there is a real bug to investigate — memcheck
+reports include a full stack trace pointing at the offending line.
+
+Stop the container when done:
+
+	docker stop pgvg
+
+Note: `Dockerfile.valgrind` is based on `debian:trixie` rather than
+`bookworm` (used by `Dockerfile.asan`) because bookworm's bundled
+Valgrind (3.19) crashes while parsing debug info produced by a modern
+gcc/glibc toolchain; trixie ships Valgrind 3.24, which handles it fine.
+
 # Usage
 
 ## roaringbitmap
