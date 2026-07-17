@@ -1,26 +1,8 @@
 /**
- * Type-independent bits shared between the 32-bit and 64-bit
- * implementations of rb_group_elements_by_source. Everything here is
- * static inline / macros, so this header carries no separate .c file;
- * each including translation unit gets its own private copies.
- *
- * The heap, hash, and array-conversion helpers below are guarded and
- * only ever expand once per TU.
- *
- * The simplehash specialisation is different: it must be re-includable,
- * since each of the 32-bit and 64-bit consumers instantiates its own
- * copy with different SH_PREFIX/types. Predefine the three
- * RB_GROUP_BY_SOURCE_HASH_* parameters below and then re-#include this
- * header; the template portion at the bottom (outside the include
- * guard) emits the entry struct, configures the SH_* macros, pulls in
- * lib/simplehash.h, and #undefs its parameters so it can be
- * re-included. Each consumer picks its own SH_PREFIX, so the 32-bit and
- * 64-bit variants do not collide; SH_SCOPE static inline keeps the
- * duplication cost negligible.
+ * Type-independent common code shared between the 32-bit and 64-bit
+ * implementations of rb_group_elements_by_source.
  *
  * Typical usage in a .c file:
- *
- *   #include "roaring_group_by_source_common.h"
  *
  *   #define RB_GROUP_BY_SOURCE_HASH_PREFIX        roaring_group_by_source_group
  *   #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE  roaring_bitmap_t *
@@ -143,11 +125,9 @@ roaring_group_by_source_bitmask_to_sources_array(const uint64_t *key,
  *                                            field
  *
  * Each consuming translation unit predefines these three parameters and
- * then re-#includes this header. This part emits the entry struct, sets
+ * then includes this header. This part emits the entry struct, sets
  * up the SH_* macros, includes lib/simplehash.h, and #undefs all three
- * parameter macros so the file is re-includable (e.g. if a single TU
- * ever needed two specialisations). Consumers are expected to invoke it
- * at most once per (prefix, types) tuple per TU.
+ * parameter macros after.
  */
 #ifdef RB_GROUP_BY_SOURCE_HASH_PREFIX
 

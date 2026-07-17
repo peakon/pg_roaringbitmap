@@ -4,9 +4,6 @@
 /**
  * 64-bit variant of rb_group_elements_by_source.  Mirrors the API of
  * roaring_group_by_source.h but operates over roaring64_bitmap_t inputs.
- * The shared cold-path heap, hash, simplehash specialisation, and
- * bitmask-to-sources helper live in roaring_group_by_source_common.h /
- * roaring_group_by_source_hash_template.h.
  */
 
 #include "postgres.h"

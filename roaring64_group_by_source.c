@@ -9,22 +9,19 @@
  *   members roaringbitmap64 – all elements contained in this combination
  *                             of input bitmaps
  *
- * This is the 64-bit mirror of roaring_group_by_source.c; it shares the
- * cold-path heap, hash, and bitmask-to-sources helpers via
- * roaring_group_by_source_common.h and emits its own simplehash
- * specialisation via roaring_group_by_source_hash_template.h.
+ * This is the 64-bit mirror of roaring_group_by_source.c
  */
 
 #include "roaring64_group_by_source.h"
-#include "roaring_group_by_source_common.h"
 
 #include <stdint.h>
 
 #include "utils/lsyscache.h"
 
 /*
- * Instantiate the 64-bit simplehash specialisation.  See
- * roaring_group_by_source_hash_template.h for the parameter contract.
+ * Pull in the shared heap/hash helpers and instantiate the 64-bit
+ * simplehash specialisation.  See roaring_group_by_source_common.h for
+ * the parameter contract.
  */
 #define RB_GROUP_BY_SOURCE_HASH_PREFIX roaring64_group_by_source_group
 #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE roaring64_bitmap_t *
