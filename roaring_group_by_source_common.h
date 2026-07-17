@@ -58,9 +58,7 @@ roaring_group_by_source_heap_build(roaring_group_by_source_heap_node_t *heap,
 }
 
 /**
- * Type-independent private_data carried on the simplehash table. Both
- * the 32-bit and 64-bit specialisations share this struct since it only
- * carries nwords.
+ * private_data carried on the simplehash table.
  */
 typedef struct roaring_group_by_source_group_private_s {
     int nwords;
