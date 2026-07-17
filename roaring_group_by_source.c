@@ -16,11 +16,6 @@
 
 #include "utils/lsyscache.h"
 
-/*
- * Pull in the shared heap/hash helpers and instantiate the 32-bit
- * simplehash specialisation.  See roaring_group_by_source_common.h for
- * the parameter contract.
- */
 #define RB_GROUP_BY_SOURCE_HASH_PREFIX roaring_group_by_source_group
 #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE roaring_bitmap_t *
 #define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring_bulk_context_t
@@ -99,7 +94,7 @@ static void roaring_group_by_source_run_merge(
     uint64_t *bitmask = (uint64_t *)palloc0(nwords * sizeof(uint64_t));
 
     while (heap_size > 0) {
-        uint32_t current_val = (uint32_t)heap[0].value;
+        uint32_t current_val = heap[0].value;
         memset(bitmask, 0, nwords * sizeof(uint64_t));
 
         // Write the indexes of iters that contain current_val into the bitmask
@@ -132,11 +127,6 @@ static void roaring_group_by_source_run_merge(
             entry->members = roaring_bitmap_create();
             memset(&entry->bulk_ctx, 0, sizeof(roaring_bulk_context_t));
         }
-        /* entry remains valid for this iteration; the next insert may grow the
-         * table, invalidating it. */
-        /* roaring_bitmap_add_bulk requires strictly ascending insertion order,
-         * which is guaranteed here because current_val is always the heap
-         * minimum. */
         roaring_bitmap_add_bulk(entry->members, &entry->bulk_ctx, current_val);
     }
 

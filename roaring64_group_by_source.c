@@ -18,11 +18,6 @@
 
 #include "utils/lsyscache.h"
 
-/*
- * Pull in the shared heap/hash helpers and instantiate the 64-bit
- * simplehash specialisation.  See roaring_group_by_source_common.h for
- * the parameter contract.
- */
 #define RB_GROUP_BY_SOURCE_HASH_PREFIX roaring64_group_by_source_group
 #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE roaring64_bitmap_t *
 #define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring64_bulk_context_t
@@ -133,11 +128,6 @@ static void roaring64_group_by_source_run_merge(
             entry->members = roaring64_bitmap_create();
             memset(&entry->bulk_ctx, 0, sizeof(roaring64_bulk_context_t));
         }
-        /* entry remains valid for this iteration; the next insert may grow the
-         * table, invalidating it. */
-        /* roaring64_bitmap_add_bulk requires strictly ascending insertion
-         * order, which is guaranteed here because current_val is always the
-         * heap minimum. */
         roaring64_bitmap_add_bulk(entry->members, &entry->bulk_ctx,
                                   current_val);
     }

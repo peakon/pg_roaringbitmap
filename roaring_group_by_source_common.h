@@ -24,12 +24,7 @@
 #include "roaring.h"
 
 /**
- * Heap node used by the k-way merge.
- *
- * The 'value' field is uint64_t so the same node type can be used by both
- * the 32-bit and 64-bit merges. The 32-bit caller simply stores its
- * uint32_t current value into this field — implicit widening, no
- * behavioural change.
+ * Heap implementation for k-way merge.
  */
 typedef struct roaring_group_by_source_heap_node_s {
     int src;        // 0-based index of iterator into the input bitmap array
@@ -62,22 +57,8 @@ roaring_group_by_source_heap_build(roaring_group_by_source_heap_node_t *heap,
         roaring_group_by_source_heap_sift_down(heap, size, i);
 }
 
-static inline uint32_t roaring_group_by_source_hash_key(const uint64_t *words,
-                                                        int nwords) {
-    uint64_t h = 0;
-    for (int i = 0; i < nwords; i++) {
-        h ^= words[i];
-        h ^= h >> 30;
-        h *= 0xbf58476d1ce4e5b9ULL;
-        h ^= h >> 27;
-        h *= 0x94d049bb133111ebULL;
-        h ^= h >> 31;
-    }
-    return (uint32_t)h;
-}
-
 /**
- * Type-independent private_data carried on the simplehash table.  Both
+ * Type-independent private_data carried on the simplehash table. Both
  * the 32-bit and 64-bit specialisations share this struct since it only
  * carries nwords.
  */
@@ -87,8 +68,7 @@ typedef struct roaring_group_by_source_group_private_s {
 
 /**
  * Convert a packed bitmask into a Postgres ArrayType containing the 1-based
- * indices of set bits.  Used by both the 32-bit and 64-bit next_row
- * implementations to emit the 'sources int[]' column.
+ * indices of set bits. Used to emit the 'sources int[]' column.
  */
 static inline ArrayType *
 roaring_group_by_source_bitmask_to_sources_array(const uint64_t *key,
@@ -109,6 +89,20 @@ roaring_group_by_source_bitmask_to_sources_array(const uint64_t *key,
         construct_array(src_buf, nsources, INT4OID, sizeof(int32_t), true, 'i');
     pfree(src_buf);
     return src_array;
+}
+
+static inline uint32_t roaring_group_by_source_hash_key(const uint64_t *words,
+                                                        int nwords) {
+    uint64_t h = 0;
+    for (int i = 0; i < nwords; i++) {
+        h ^= words[i];
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        h *= 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+    }
+    return (uint32_t)h;
 }
 
 #endif /* ROARING_GROUP_BY_SOURCE_COMMON_H */
