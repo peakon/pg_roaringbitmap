@@ -1,18 +1,22 @@
-#ifndef ROARING_GROUP_BY_SOURCE_COMMON_H
-#define ROARING_GROUP_BY_SOURCE_COMMON_H
-
 /**
- * Type-independent cold-path bits shared between the 32-bit and 64-bit
- * implementations of rb_group_elements_by_source.
+ * Type-independent bits shared between the 32-bit and 64-bit
+ * implementations of rb_group_elements_by_source. Everything here is
+ * static inline / macros, so this header carries no separate .c file;
+ * each including translation unit gets its own private copies.
  *
- * The simplehash specialisation is templated per consuming translation
- * unit via roaring_group_by_source_hash_template.h.  Each consumer
- * predefines three preprocessor parameters and then #includes the
- * template header, which emits the entry struct, configures the SH_*
- * macros, pulls in lib/simplehash.h, and #undefs its parameters so it
- * can be re-included.  Each consumer picks its own SH_PREFIX, so the
- * 32-bit and 64-bit variants do not collide; SH_SCOPE static inline
- * keeps the duplication cost negligible.
+ * The heap, hash, and array-conversion helpers below are guarded and
+ * only ever expand once per TU.
+ *
+ * The simplehash specialisation is different: it must be re-includable,
+ * since each of the 32-bit and 64-bit consumers instantiates its own
+ * copy with different SH_PREFIX/types. Predefine the three
+ * RB_GROUP_BY_SOURCE_HASH_* parameters below and then re-#include this
+ * header; the template portion at the bottom (outside the include
+ * guard) emits the entry struct, configures the SH_* macros, pulls in
+ * lib/simplehash.h, and #undefs its parameters so it can be
+ * re-included. Each consumer picks its own SH_PREFIX, so the 32-bit and
+ * 64-bit variants do not collide; SH_SCOPE static inline keeps the
+ * duplication cost negligible.
  *
  * Typical usage in a .c file:
  *
@@ -21,14 +25,18 @@
  *   #define RB_GROUP_BY_SOURCE_HASH_PREFIX        roaring_group_by_source_group
  *   #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE  roaring_bitmap_t *
  *   #define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring_bulk_context_t
- *   #include "roaring_group_by_source_hash_template.h"
+ *   #include "roaring_group_by_source_common.h"
  */
+
+#ifndef ROARING_GROUP_BY_SOURCE_COMMON_H
+#define ROARING_GROUP_BY_SOURCE_COMMON_H
 
 #include "postgres.h"
 
 #include <stdint.h>
 #include <string.h>
 
+#include "catalog/pg_type.h"
 #include "utils/array.h"
 
 #include "roaring.h"
@@ -100,8 +108,95 @@ typedef struct roaring_group_by_source_group_private_s {
  * indices of set bits.  Used by both the 32-bit and 64-bit next_row
  * implementations to emit the 'sources int[]' column.
  */
-ArrayType *
+static inline ArrayType *
 roaring_group_by_source_bitmask_to_sources_array(const uint64_t *key,
-                                                 int nwords);
+                                                 int nwords) {
+    int max_sources = nwords * 64;
+    Datum *src_buf = (Datum *)palloc(max_sources * sizeof(Datum));
+    int nsources = 0;
+    for (int w = 0; w < nwords; w++) {
+        uint64_t v = key[w];
+        int base = w * 64;
+        while (v) {
+            int bitpos = roaring_trailing_zeroes(v);
+            src_buf[nsources++] = Int32GetDatum(base + bitpos + 1);
+            v &= v - 1;
+        }
+    }
+    ArrayType *src_array =
+        construct_array(src_buf, nsources, INT4OID, sizeof(int32_t), true, 'i');
+    pfree(src_buf);
+    return src_array;
+}
 
+#endif /* ROARING_GROUP_BY_SOURCE_COMMON_H */
+
+/**
+ * Re-includable simplehash template, parameterised on:
+ *
+ *   RB_GROUP_BY_SOURCE_HASH_PREFIX         – the SH_PREFIX
+ *   RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE   – type of the members-bitmap
+ *                                            pointer field (e.g.
+ *                                            roaring_bitmap_t * or
+ *                                            roaring64_bitmap_t *)
+ *   RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE  – type of the bulk-add context
+ *                                            field
+ *
+ * Each consuming translation unit predefines these three parameters and
+ * then re-#includes this header. This part emits the entry struct, sets
+ * up the SH_* macros, includes lib/simplehash.h, and #undefs all three
+ * parameter macros so the file is re-includable (e.g. if a single TU
+ * ever needed two specialisations). Consumers are expected to invoke it
+ * at most once per (prefix, types) tuple per TU.
+ */
+#ifdef RB_GROUP_BY_SOURCE_HASH_PREFIX
+
+#ifndef RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE
+#error "roaring_group_by_source_common.h: RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE must be defined before include"
 #endif
+#ifndef RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE
+#error "roaring_group_by_source_common.h: RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE must be defined before include"
+#endif
+
+/* Helpers to construct the entry-type identifier as <prefix>_entry_t. */
+#define RB_GROUP_BY_SOURCE_HASH_PASTE_(a, b) a##b
+#define RB_GROUP_BY_SOURCE_HASH_PASTE(a, b) RB_GROUP_BY_SOURCE_HASH_PASTE_(a, b)
+#define RB_GROUP_BY_SOURCE_HASH_ENTRY_T                                        \
+    RB_GROUP_BY_SOURCE_HASH_PASTE(RB_GROUP_BY_SOURCE_HASH_PREFIX, _entry_t)
+#define RB_GROUP_BY_SOURCE_HASH_ENTRY_S                                        \
+    RB_GROUP_BY_SOURCE_HASH_PASTE(RB_GROUP_BY_SOURCE_HASH_PREFIX, _entry_s)
+
+typedef struct RB_GROUP_BY_SOURCE_HASH_ENTRY_S {
+    uint64_t *key; /* palloc'd bitmask of input bitmap indexes */
+    RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE members;
+    RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE bulk_ctx;
+    char status; /* required by simplehash */
+} RB_GROUP_BY_SOURCE_HASH_ENTRY_T;
+
+#define SH_PREFIX RB_GROUP_BY_SOURCE_HASH_PREFIX
+#define SH_ELEMENT_TYPE RB_GROUP_BY_SOURCE_HASH_ENTRY_T
+#define SH_KEY_TYPE uint64_t *
+#define SH_KEY key
+#define SH_HASH_KEY(tb, k)                                                     \
+    roaring_group_by_source_hash_key(                                          \
+        (k), ((roaring_group_by_source_group_private_t *)(tb)->private_data)   \
+                 ->nwords)
+#define SH_EQUAL(tb, a, b)                                                     \
+    (memcmp((a), (b),                                                          \
+            ((roaring_group_by_source_group_private_t *)(tb)->private_data)    \
+                    ->nwords *                                                 \
+                sizeof(uint64_t)) == 0)
+#define SH_SCOPE static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+#undef RB_GROUP_BY_SOURCE_HASH_PREFIX
+#undef RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE
+#undef RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE
+#undef RB_GROUP_BY_SOURCE_HASH_PASTE_
+#undef RB_GROUP_BY_SOURCE_HASH_PASTE
+#undef RB_GROUP_BY_SOURCE_HASH_ENTRY_T
+#undef RB_GROUP_BY_SOURCE_HASH_ENTRY_S
+
+#endif /* RB_GROUP_BY_SOURCE_HASH_PREFIX */

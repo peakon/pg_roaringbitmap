@@ -15,7 +15,6 @@
 
 #include <stdint.h>
 
-#include "roaringbitmap.h"
 #include "utils/lsyscache.h"
 
 /*
@@ -25,7 +24,7 @@
 #define RB_GROUP_BY_SOURCE_HASH_PREFIX roaring_group_by_source_group
 #define RB_GROUP_BY_SOURCE_HASH_MEMBERS_TYPE roaring_bitmap_t *
 #define RB_GROUP_BY_SOURCE_HASH_BULK_CTX_TYPE roaring_bulk_context_t
-#include "roaring_group_by_source_hash_template.h"
+#include "roaring_group_by_source_common.h"
 
 /**
  * Internal state for roaring_group_by_source_next_row()
