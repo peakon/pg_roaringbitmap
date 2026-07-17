@@ -448,8 +448,7 @@ or
     from rb_group_elements_by_source(ARRAY[
         rb_build('{1,2,3,4,5}'),
         rb_build('{1,2,3,6,7}')
-    ])
-    order by sources::text</pre></td>
+    ])</pre></td>
         <td><pre>sources | rb_to_array
 --------+------------
 {1,2}   | {1,2,3}
@@ -964,8 +963,7 @@ or
     from rb64_group_elements_by_source(ARRAY[
         rb64_build('{1,2,3,4,5}'),
         rb64_build('{1,2,3,6,7}')
-    ])
-    order by sources::text</pre></td>
+    ])</pre></td>
         <td><pre>sources | rb64_to_array
 --------+--------------
 {1,2}   | {1,2,3}
